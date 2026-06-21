@@ -30,20 +30,60 @@ $db = getDbConnection();
 
 function findCustomer($db, $transactionReference)
 {
-    if (empty($transactionReference)) return null;
-
     $transactionReference = trim($transactionReference);
-    
-    $stmt = $db->prepare("SELECT ag_id,ip,ag_mobile_no FROM re_tbl_agent 
-                         WHERE ip = ? OR ag_mobile_no = ? LIMIT 1");
+
+    // re_tbl_agent
+    $stmt = $db->prepare("
+        SELECT ag_id,'re_tbl_agent' as source
+        FROM re_tbl_agent
+        WHERE ip = ? OR ag_mobile_no = ?
+        LIMIT 1
+    ");
     $stmt->bind_param("ss", $transactionReference, $transactionReference);
     $stmt->execute();
-    $result = $stmt->get_result();
-    $customer = $result->fetch_assoc();
+    $customer = $stmt->get_result()->fetch_assoc();
     $stmt->close();
 
-    return $customer;
+    if ($customer) {
+        return $customer;
+    }
+
+    // tbl_agent
+    $stmt = $db->prepare("
+        SELECT ag_id,'tbl_agent' as source
+        FROM tbl_agent
+        WHERE ip = ? OR ag_mobile_no = ?
+        LIMIT 1
+    ");
+    $stmt->bind_param("ss", $transactionReference, $transactionReference);
+    $stmt->execute();
+    $customer = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    if ($customer) {
+        return $customer;
+    }
+
+    // reseller username
+    $stmt = $db->prepare("
+        SELECT UserId,'reseller' as source
+        FROM _reseller_createuser
+        WHERE UserName = ?
+        LIMIT 1
+    ");
+    $stmt->bind_param("s", $transactionReference);
+    $stmt->execute();
+    $customer = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    if ($customer) {
+        return $customer;
+    }
+
+    return null;
 }
+
+
 // $customer = findCustomer($db, '01999224934');
 
 
@@ -178,35 +218,131 @@ if ($messageType === 'Notification' || ($payload['Type'] ?? '') === 'Notificatio
         exit;
     }
 
-    // Save Transaction
-    $stmt = $db->prepare("INSERT INTO bkash_transactions 
-        (payment_id, type, currency, amount, customer_id, status, trx_id, 
-         merchant_invoice_number, payment_time, mobile, created_at) 
-        VALUES (?, 'webhook', ?, ?, ?, ?, ?, ?, ?, ?, NOW())");
+    // ==================== Process Payment by Source ====================
+    $dateEn = date('Y-m-d H:i:s');
 
-    $payment_id = $trxID ?? $invoice ?? '';
-    $stmt->bind_param("ssdisssss", 
-        $payment_id, 
-        $currency, 
-        $amount, 
-        $customer['ag_id'], 
-        $transactionStatus, 
-        $trxID, 
-        $invoice, 
-        $dateTime, 
-        $paynumber
+    if ($customer['source'] == 're_tbl_agent') {
+        
+        callEnableApi($enableURL, $customer['ag_id'], $amount);
+
+    } elseif ($customer['source'] == 'tbl_agent') {
+        
+        $sql = "SELECT function_bill_update(
+                    {$customer['ag_id']},
+                    'billpay',
+                    {$amount},
+                    0,
+                    '',
+                    101,
+                    2,
+                    'paid by bkash'
+                ) AS function_bill_update";
+        $db->query($sql);
+        
+        $url = "https://gnet.tbotechno.xyz/enable_request_marchant.php?ag_id=" . urlencode($customer['ag_id']);
+
+        file_get_contents($url);
+
+    } elseif ($customer['source'] == 'reseller') {
+        
+        $userId = $customer['UserId'];
+
+        // Get current balance
+        $stmt = $db->prepare("SELECT balance FROM _reseller_createuser WHERE UserId = ?");
+        $stmt->bind_param("i", $userId);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        $reseller = $result->fetch_assoc();
+        $stmt->close();
+
+        if ($reseller) {
+            $newBalance = $reseller['balance'] + $amount;
+
+            // Update balance
+            $stmt = $db->prepare("UPDATE _reseller_createuser SET balance = ? WHERE UserId = ?");
+            $stmt->bind_param("di", $newBalance, $userId);
+            $stmt->execute();
+            $stmt->close();
+
+            // Insert into reseller account (Credit)
+            $stmt = $db->prepare("INSERT INTO re_tbl_reseller_account 
+                (admin_id, reseller_id, amount, type, description, entry_by, entry_date) 
+                VALUES (100, ?, ?, 1, 'Balance added from Bkash Payment Webhook', 100, ?)");
+            $stmt->bind_param("ids", $userId, $amount, $dateEn);
+            $stmt->execute();
+            $stmt->close();
+
+            // Insert into reseller account (Payment Received)
+            $stmt = $db->prepare("INSERT INTO re_tbl_reseller_account 
+                (admin_id, reseller_id, amount, type, description, entry_by, entry_date) 
+                VALUES (100, ?, ?, 3, 'Payment receive from Bkash Payment Webhook', 100, ?)");
+            $stmt->bind_param("ids", $userId, $amount, $dateEn);
+            $stmt->execute();
+            $lastResellerAccountId = $stmt->insert_id;
+            $stmt->close();
+
+            // Insert into main account table
+            $stmt = $db->prepare("INSERT INTO re_tbl_account 
+                (reseller_id, reseller_account_id, acc_amount, acc_description, acc_type, entry_by, entry_date) 
+                VALUES (?, ?, ?, 'Payment receive from Bkash Payment Webhook', 3, 100, ?)");
+            $stmt->bind_param("iids", $userId, $lastResellerAccountId, $amount, $dateEn);
+            $stmt->execute();
+            $stmt->close();
+
+            bkash_log('Reseller Balance Updated', [
+                'userId' => $userId,
+                'amount' => $amount,
+                'new_balance' => $newBalance
+            ]);
+        }
+    }
+    
+    
+    
+    
+
+        // ==================== Save Transaction (Simple & Stable Version) ====================
+    $payment_id     = !empty($trxID) ? $trxID : ($invoice ?? 'N/A');
+    $customer_id    = ($customer['source'] !== 'reseller') ? ($customer['ag_id'] ?? 0) : 0;
+    $reseller_id    = ($customer['source'] == 'reseller') ? $customer['UserId'] : 0;   // 0 instead of null
+
+    $stmt = $db->prepare("INSERT INTO bkash_transactions 
+        (payment_id, type, currency, amount, customer_id, reseller_id, status, 
+         trx_id, merchant_invoice_number, payment_time, mobile, created_at)
+        VALUES (?, 'webhook', ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())");
+
+    // All parameters as string to avoid type issues
+    $stmt->bind_param("sssdssssss",
+        $payment_id,           // s
+        $currency,             // s
+        $amount,               // s (changed to s)
+        $customer_id,          // s (changed)
+        $reseller_id,          // s (changed)
+        $transactionStatus,    // s
+        $trxID,                // s
+        $invoice,              // s
+        $dateTime,             // s
+        $paynumber             // s
     );
 
     if ($stmt->execute()) {
         $insertId = $stmt->insert_id;
-        bkash_log('Transaction Saved Successfully', ['id' => $insertId]);
+        bkash_log('✅ Transaction Saved Successfully', [
+            'id'          => $insertId,
+            'trxID'       => $trxID,
+            'amount'      => $amount,
+            'reseller_id' => $reseller_id,
+            'customer_id' => $customer_id
+        ]);
     } else {
-        bkash_log('Failed to Save Transaction', ['error' => $stmt->error]);
+        bkash_log('❌ Failed to Save Transaction', [
+            'error' => $stmt->error,
+            'errno' => $stmt->errno,
+            'payment_id' => $payment_id,
+            'trxID' => $trxID
+        ]);
     }
     $stmt->close();
-
-    // Call Enable API
-     callEnableApi($enableURL, $customer['ag_id'], $amount);
 
     $db->close();
     http_response_code(200);
