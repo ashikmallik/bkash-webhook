@@ -118,6 +118,48 @@ function savePayment($executeResponse, $model)
                 're_enable_response' => $response
             ];
         }
+        
+        
+        $currency   = $executeResponse['currency'] ?? 'BDT';
+        $status     = $executeResponse['transactionStatus'] ?? 'Completed';
+        $mobile     = $executeResponse['customerMsisdn'] ?? '';
+        $invoiceNo  = $executeResponse['merchantInvoiceNumber'] ?? '';
+        $paymentTime = $executeResponse['paymentExecuteTime']
+                    ?? $executeResponse['paymentCreateTime']
+                    ?? date('Y-m-d H:i:s');
+
+    $model->insertGetId("
+        INSERT INTO bkash_transactions
+        (
+            payment_id,
+            type,
+            currency,
+            amount,
+            customer_id,
+            reseller_id,
+            status,
+            trx_id,
+            merchant_invoice_number,
+            payment_time,
+            mobile,
+            created_at
+        )
+        VALUES
+        (
+            '$paymentId',
+            '$type',
+            '$currency',
+            '$postAmount',
+            '$cusId',
+            '$resellerId',
+            '$status',
+            '$trxId',
+            '$invoiceNo',
+            '$paymentTime',
+            '$mobile',
+            NOW()
+        )
+    ");
     // return $result;
 }
 
